@@ -764,12 +764,6 @@ EVENT is ignored."
                                         (buffer-string))))))
       (malinka--info "Cmake command for \"%s\" finished. Proceeding to process the output" project-name)
       (kill-buffer buffer)
-      ;; for some reason irony seems to stop autodetecting the compile database
-      ;; in cmake build dir so let' copy it to the root directory too. Not very elegant solution
-	  (let ((root-cdb (f-join root-dir "compile_commands.json")))
-
-		(when (f-exists? root-cdb) (f-delete root-cdb))
-		(f-copy compile-database root-cdb))
       (with-temp-buffer
         (malinka--select-project build-dir)))))
 
@@ -976,19 +970,31 @@ manually."
      (:else
       (malinka--warning "Could not select a compilation database for \"%s\"" (malinka--project-name project))))))
 
-(defun malinka--select-project (directory)
-  "Select a malinka project at DIRECTORY.
-A compilecommands.json compilation database must already exist there.
-This feeds the compilation database to rtags."
+;; chose existing project
+(defun malinka--chose-project (directory &optional project-name)
   (let ((cdb-file (f-join directory "compile_commands.json")))
   (when (malinka--rtags-assert-rdm-runs)
     (if (f-exists? cdb-file)
         (progn
-          (malinka--info "Feeding compile database file: \"%s\" to RTAGS" cdb-file)
-          (malinka--rtags-invoke-with "-W" directory)
-          (malinka--rtags-invoke-with "-J" directory))
+          (malinka--info "Choosing project: \"%s\" in RTAGS" project-name)
+          (malinka--rtags-invoke-with "-w" project-name))
       ;; else
       (malinka-user-error "Could not find a compilation database file in directory %s" directory)))))
+
+;; it is reindexing not selecting
+(defun malinka--select-project (directory &optional project-name)
+  "Select a malinka project at DIRECTORY.
+A compilecommands.json compilation database must already exist there.
+This feeds the compilation database to rtags."
+  (let ((cdb-file (f-join directory "compile_commands.json")))
+    (when (malinka--rtags-assert-rdm-runs)
+      (if (f-exists? cdb-file)
+          (progn
+            (malinka--info "Feeding compile database file: \"%s\" to RTAGS" cdb-file)
+            (malinka--rtags-invoke-with "-W" directory)
+            (malinka--rtags-invoke-with "-J" directory))
+        ;; else
+        (malinka-user-error "Could not find a compilation database file in directory %s" directory)))))
 
 (defun malinka--handle-compile-finish (process event)
   "Handle all events from the project compilation PROCESS.
@@ -1246,12 +1252,7 @@ exist then it's nice to provide the ROOT-DIR of the project to configure"
     (unless project-map (malinka-user-error "Could not find project map for %s" name))
     (malinka--project-map-update-compiledb project-map)))
 
-;;;###autoload
-(defun malinka-project-select (name given-root-dir)
-  "Select a project by querying for both NAME and GIVEN-ROOT-DIR.
-
-If multiple projects with the same name in different directories may
-exist then it's nice to provide the ROOT-DIR of the project to configure"
+(defun malinka--read-project-info (name root)
   (interactive
    (let* ((project-name
            (malinka--read-project "Project: " (malinka--default-project)))
@@ -1259,8 +1260,15 @@ exist then it's nice to provide the ROOT-DIR of the project to configure"
           (given-dir (if project-root-dir project-root-dir
                        (read-directory-name "Project root: "))))
      (list project-name given-dir)))
+  (list name root))
 
-  (malinka--info "Configuring project %s" name)
+(defun malinka--process-project (name given-root-dir procfunc)
+  "Select a project by querying for both NAME and GIVEN-ROOT-DIR.
+
+If multiple projects with the same name in different directories may
+exist then it's nice to provide the ROOT-DIR of the project to configure"
+
+  (malinka--info "Processing project %s" name)
 
   (let* ((root-dir (f-canonical given-root-dir))
          (project-map (gethash name malinka--projects-map))
@@ -1269,10 +1277,29 @@ exist then it's nice to provide the ROOT-DIR of the project to configure"
     (malinka--debug "root dir is %s" root-dir)
 
     (if project-map
-        (malinka--select-project
-         (if (malinka--project-compatible-cmake? project-map) project-build-dir root-dir))
+        (funcall procfunc
+         (if (malinka--project-compatible-cmake? project-map) project-build-dir root-dir) name)
       ;; else - given project NAME not found
       (malinka-user-error "Project %s is not known.  Use malinka-define-project to fix this" name))))
+
+;;;###autoload
+(defun malinka-project-select ()
+  "Select a project by querying for both NAME and GIVEN-ROOT-DIR.
+
+If multiple projects with the same name in different directories may
+exist then it's nice to provide the ROOT-DIR of the project to configure"
+  (interactive)
+  (apply 'malinka--process-project (append
+                                    (call-interactively 'malinka--read-project-info)
+                                    '(malinka--chose-project))))
+
+
+;;;###autoload
+(defun malinka-project-reindex ()
+  (interactive)
+  (apply 'malinka--process-project (append
+                                    (call-interactively 'malinka--read-project-info)
+                                    '(malinka--select-project))))
 
 ;;;###autoload
 (define-minor-mode malinka-mode
@@ -1286,26 +1313,6 @@ exist then it's nice to provide the ROOT-DIR of the project to configure"
         (:else
          (malinka-idle-project-check-timer-update nil))))
 
-;;; --- Interface with flycheck if existing ---
-(eval-after-load 'flycheck
-  (progn
-    (defun malinka-flycheck-clang-interface()
-      "Configure flycheck clang's syntax checker according to what we know."
-      (with-current-buffer (current-buffer)
-        (let ((buffer (current-buffer)))
-          (when (malinka--buffer-is-c? buffer)
-            (let* ((filename (buffer-file-name buffer))
-                   (query (malinka--file-belongs-to-project filename)))
-              (when query
-                (let ((fileattr (nth 1 query)))
-                  (when (malinka--file-attributes-p fileattr)
-                    (let ((defines  (malinka--file-attributes-defines fileattr))
-                          (includes (malinka--file-attributes-includes fileattr)))
-                      (setq flycheck-clang-definitions defines)
-                      (setq flycheck-clang-include-path includes))))))))))
-
-    (add-hook 'flycheck-before-syntax-check-hook
-              'malinka-flycheck-clang-interface)))
 
 (provide 'malinka)
 ;;; malinka.el ends here
